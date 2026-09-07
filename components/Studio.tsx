@@ -28,6 +28,7 @@ import {
   type CoercedSlide
 } from "@/lib/coerce";
 import {
+  MAX_SOURCE_CHARS,
   buildGeneratePrompt,
   buildArticlePrompt,
   buildVerifyPrompt,
@@ -49,6 +50,7 @@ import {
   type VoiceSample
 } from "@/lib/voiceSamples";
 import { humanizeDeck, humanizeNote, humanizeText } from "@/lib/humanizePass";
+import { diffDecks, slideTarget, type EditDiffRow } from "@/lib/editDiff";
 import { lintContent } from "@/lib/slopLint";
 import { CHANNEL_IDS, type ChannelId } from "@/lib/founderProfiles";
 import { storeGet, storeSet, storePeek } from "@/lib/storeClient";
@@ -60,6 +62,11 @@ import { Logo } from "./Logo";
 
 const font = FONT;
 const displayFont = DISPLAY_FONT;
+
+const SOURCE_KEY = "kognoz-source-material";
+
+const NO_SAMPLES_NOTE =
+  "No voice samples saved yet, so this was written with no human writing to imitate. Paste real published posts below.";
 
 interface VerifyCheck {
   where: string;
@@ -126,6 +133,19 @@ export default function Studio() {
   const [sampleChannel, setSampleChannel] = useState<ChannelId>("Kognoz page");
   const [sampleKind, setSampleKind] = useState<SampleKind>("post");
   const [showSamples, setShowSamples] = useState(false);
+  // Whose voice this deck is in. Captions have always had this; decks did not,
+  // so deck copy was written by nobody in particular and could not pick the
+  // right person's samples.
+  const [channel, setChannel] = useState<ChannelId>("Kognoz page");
+  // Notes, a transcript, dictated thoughts. A topic line is not enough material
+  // to say anything specific, and generic input is most of why output reads
+  // generic. Kept in localStorage so a refresh does not lose a pasted
+  // transcript, following the single-slot pattern in lib/articleDraft.ts.
+  const [sourceMaterial, setSourceMaterial] = useState("");
+  const [showSource, setShowSource] = useState(false);
+  // What the edit pass changed, field by field, so a person can keep the
+  // original wording of one slide instead of taking the rewrite whole.
+  const [editDiff, setEditDiff] = useState<EditDiffRow[] | null>(null);
   // What the second pass did. The score itself is derived below, not stored: a
   // stored score goes stale the moment someone edits a field by hand, and the
   // panel would then be reporting on text that is no longer on screen.
@@ -241,7 +261,12 @@ export default function Studio() {
       if (d && Object.keys(d).length) setDesignLocal((cur) => ({ ...cur, ...d }));
       if (typeof hp === "string") setHousePrefsLocal(hp);
       if (Array.isArray(sm)) setStyleMem(sm);
-      setVoiceSamples(coerceSamples(vs));
+      const samples = coerceSamples(vs);
+      setVoiceSamples(samples);
+      // Until real posts are in here, every draft is written with no human
+      // writing to imitate, which is the whole point of the feature. An empty
+      // corpus should not be a small red line inside a collapsed panel.
+      if (!samples.length) setShowSamples(true);
     })();
   }, []);
 
@@ -300,6 +325,56 @@ export default function Studio() {
     const next = [...styleMem.filter((e) => e.cover !== cover), ex].slice(-6);
     setStyleMem(next);
     storeSet("kognoz-style-memory", next);
+  };
+
+  // Restore any pasted transcript on mount. localStorage rather than the shared
+  // store: this is one person's working notes, not team state.
+  useEffect(() => {
+    try {
+      const v = localStorage.getItem(SOURCE_KEY);
+      if (v) {
+        setSourceMaterial(v);
+        setShowSource(true);
+      }
+    } catch {
+      /* private mode or quota — the field just starts empty */
+    }
+  }, []);
+
+  const saveSourceMaterial = (v: string) => {
+    setSourceMaterial(v);
+    try {
+      if (v.trim()) localStorage.setItem(SOURCE_KEY, v);
+      else localStorage.removeItem(SOURCE_KEY);
+    } catch {
+      /* not worth an error banner; the value is still in state for this session */
+    }
+  };
+
+  /**
+   * Switch one field between the pass-one wording and the edited wording.
+   *
+   * Writes through the same setters the manual editors use, so the undo snapshot
+   * and the verify-staleness flag behave exactly as they do for a hand edit.
+   */
+  const useWording = (key: string, which: "edited" | "original") => {
+    const row = (editDiff || []).find((r) => r.key === key);
+    if (!row || row.using === which) return;
+    const text = which === "edited" ? row.edited : row.original;
+
+    if (key === "cover") setCover(text);
+    else if (key === "cta") setCta(text);
+    else {
+      const target = slideTarget(key);
+      if (target) updSlide(target.index, target.field, text);
+    }
+    setEditDiff((rows) => (rows || []).map((r) => (r.key === key ? { ...r, using: which } : r)));
+    bumpReplay();
+    markVerifyStale();
+  };
+
+  const revertEditPass = () => {
+    for (const row of editDiff || []) useWording(row.key, "original");
   };
 
   const persistSamples = (next: VoiceSample[]) => {
@@ -539,10 +614,13 @@ export default function Studio() {
     // Clear before the call, not after: a failed generation would otherwise leave
     // the previous deck's edit-pass note sitting under the new topic.
     setPassNote("");
+    setEditDiff(null);
     try {
       // Chosen once and used for both passes, so the draft and the line edit are
       // measured against the same writing.
-      const samples = pickSamples(voiceSamples, { kind: "slide", seed });
+      // Channel first: with a voice chosen, pickSamples prefers that person's
+      // writing and falls back to their posts when no slide samples exist.
+      const samples = pickSamples(voiceSamples, { channel, kind: "slide", seed });
       const { system, user, useSearch } = buildGeneratePrompt({
         topic: gTopic,
         pillar: gPillar,
@@ -551,6 +629,8 @@ export default function Studio() {
         housePrefs,
         styleMem,
         voiceSamples: samples,
+        channel,
+        sourceMaterial,
         seed,
         fresh,
         grounded: gGrounded
@@ -566,14 +646,22 @@ export default function Studio() {
 
       // Second pass: the line edit. It never throws — a failure returns the draft
       // untouched, because the draft is already paid for and already usable.
-      const edited = await humanizeDeck(parsed, { voiceSamples: samples, housePrefs });
-      setPassNote(humanizeNote(edited));
+      // No source material here on purpose: the edit pass freezes every fact in
+      // the draft, and handing it new material would invite claims nobody
+      // reviewed onto the slides.
+      const edited = await humanizeDeck(parsed, { voiceSamples: samples, housePrefs, channel });
+      setPassNote(voiceSamples.length ? humanizeNote(edited) : NO_SAMPLES_NOTE);
 
       // Back through the quality firewall: the edit pass is a model reply like any
       // other and must not be trusted with URLs, dashes or character budgets.
       const final = coerceContent(edited.value, parsed.slides.length, { body: bodyBudget });
       if (gFormat === "Idea Deck") final.slides = applyIdeaDeckKickers(final.slides, ideaStyle);
       if (gFormat === "Stat Card" && final.slides[0]) final.slides[0] = applyStatCardHygiene(final.slides[0]);
+
+      // Diff the two COERCED versions. Comparing the raw model reply against the
+      // coerced draft would report the quality firewall's own edits — clamped
+      // lengths, stripped URLs, capitalised lines — as though the editor made them.
+      setEditDiff(edited.applied ? diffDecks(parsed, final) : null);
 
       setEyebrow(gPillar);
       setCover(final.cover);
@@ -999,6 +1087,7 @@ export default function Studio() {
     const qSet = searchParams.get("set") as DesignSetId | null;
     const qStyle = searchParams.get("style") as IdeaStyle | null;
     const qN = searchParams.get("n");
+    const qChannel = searchParams.get("channel");
     const qAutorun = searchParams.get("autorun") === "1";
     // A calendar slot that has never been filled in links here with an empty topic
     // (`topic=&n=new`). Previously that bailed out entirely and you landed on a blank
@@ -1020,6 +1109,10 @@ export default function Studio() {
       setEyebrow(qPillar);
     }
     if (qTopic) setTopic(qTopic);
+    // Only the three real identities get selected. Anything else — "LinkedIn" is
+    // the calendar's quick-add default — leaves the company page selected rather
+    // than putting a deck into a real person's first-person voice by accident.
+    if (qChannel && (CHANNEL_IDS as string[]).includes(qChannel)) setChannel(qChannel as ChannelId);
     setPrimedFromCalendar(Boolean(qTopic));
     setCurrent(0);
     // `n=new` is an unsaved slot, not a calendar row to mark as drafted. Everything
@@ -1239,6 +1332,24 @@ export default function Studio() {
           ))}
         </div>
 
+        {/*
+          Whose voice this deck is in. Decks had no such notion, so unlike a
+          caption they could not pick the right person's writing samples, and the
+          copy came out belonging to nobody.
+        */}
+        <span style={label}>Publishing as</span>
+        <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
+          {CHANNEL_IDS.map((c) => (
+            <div
+              key={c}
+              onClick={() => { if (!busy) setChannel(c); }}
+              style={{ ...chip(channel === c, C.blue), cursor: busy ? "default" : "pointer", opacity: busy ? 0.55 : 1 }}
+            >
+              {c}
+            </div>
+          ))}
+        </div>
+
         <span style={label}>Topic</span>
         <textarea
           value={topic}
@@ -1253,6 +1364,51 @@ export default function Studio() {
           }
           style={{ ...inputStyle, marginBottom: 10 }}
         />
+
+        {/*
+          Raw material. This is the difference between writing ABOUT a subject
+          and writing FROM something, and it is the deepest fix available for
+          copy that reads generic: a topic line gives the model nothing specific
+          to say, so it says the general thing.
+        */}
+        <button
+          type="button"
+          onClick={() => setShowSource((v) => !v)}
+          style={{
+            display: "flex", alignItems: "center", gap: 6, width: "100%", textAlign: "left",
+            fontFamily: font, fontSize: 11.5, fontWeight: 700, color: sourceMaterial.trim() ? C.teal : C.inkSoft,
+            background: "none", border: "none", padding: "0 0 8px", cursor: "pointer"
+          }}
+        >
+          <span>{showSource ? "▾" : "▸"}</span>
+          <span>
+            Notes, transcript or rough thoughts
+            {sourceMaterial.trim() ? ` · ${sourceMaterial.trim().length.toLocaleString()} characters` : " · optional"}
+          </span>
+        </button>
+        {showSource && (
+          <>
+            <textarea
+              value={sourceMaterial}
+              onChange={(e) => saveSourceMaterial(e.target.value.slice(0, MAX_SOURCE_CHARS))}
+              rows={5}
+              placeholder="Paste what you actually have. A call transcript, notes from a client conversation, a paragraph you dictated on the way home. Specifics beat polish here: names of behaviours, numbers somebody quoted, what was actually said in the room."
+              style={{ ...inputStyle, marginBottom: 6, fontSize: 12.5 }}
+            />
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontFamily: font, fontSize: 10.5, color: C.inkMute, marginBottom: 10, lineHeight: 1.5 }}>
+              <span>
+                {sourceMaterial.length >= MAX_SOURCE_CHARS
+                  ? `At the ${MAX_SOURCE_CHARS.toLocaleString()} character limit. Trim to the part that matters.`
+                  : `${(MAX_SOURCE_CHARS - sourceMaterial.length).toLocaleString()} characters left. Used for the draft only, never the edit pass.`}
+              </span>
+              {sourceMaterial.trim() && (
+                <button type="button" onClick={() => saveSourceMaterial("")} style={{ fontFamily: font, fontSize: 10.5, color: C.inkMute, background: "none", border: "none", cursor: "pointer", padding: 0 }}>
+                  clear
+                </button>
+              )}
+            </div>
+          </>
+        )}
         <label
           style={{
             display: "flex", alignItems: "flex-start", gap: 9, marginBottom: 10, cursor: "pointer",
@@ -1322,6 +1478,66 @@ export default function Studio() {
                 ))}
               </ul>
             )}
+          </div>
+        )}
+
+        {/*
+          What the line-editing pass actually changed.
+          Without this the second pass is a black box: it rewrites the deck and
+          the only feedback is a score. Here a person can read both wordings and
+          keep their own on any single field.
+        */}
+        {editDiff && editDiff.length > 0 && (
+          <div style={{ marginTop: 12, border: `1px solid ${C.line}`, borderRadius: 9, background: C.mist, padding: "10px 11px" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 7 }}>
+              <span style={{ fontFamily: font, fontSize: 11.5, fontWeight: 700, color: C.ink }}>
+                The edit pass changed {editDiff.length} {editDiff.length === 1 ? "field" : "fields"}
+              </span>
+              <button
+                type="button"
+                onClick={revertEditPass}
+                disabled={editDiff.every((r) => r.using === "original")}
+                style={{
+                  fontFamily: font, fontSize: 10.5, fontWeight: 600, background: "none", border: "none", padding: 0,
+                  color: editDiff.every((r) => r.using === "original") ? C.inkMute : C.blue,
+                  cursor: editDiff.every((r) => r.using === "original") ? "default" : "pointer"
+                }}
+              >
+                keep all originals
+              </button>
+            </div>
+
+            <div style={{ maxHeight: 260, overflowY: "auto" }}>
+              {editDiff.map((row) => (
+                <div key={row.key} style={{ padding: "7px 0", borderTop: `1px solid ${C.line}` }}>
+                  <div style={{ fontFamily: font, fontSize: 10, fontWeight: 700, color: C.teal, textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 3 }}>
+                    {row.where}
+                  </div>
+                  {(["original", "edited"] as const).map((which) => (
+                    <button
+                      key={which}
+                      type="button"
+                      onClick={() => useWording(row.key, which)}
+                      style={{
+                        display: "block", width: "100%", textAlign: "left", marginBottom: 3, padding: "5px 7px",
+                        fontFamily: font, fontSize: 11.5, lineHeight: 1.45, borderRadius: 6, cursor: "pointer",
+                        whiteSpace: "pre-wrap",
+                        border: `1px solid ${row.using === which ? C.blue : C.line}`,
+                        background: row.using === which ? C.white : "transparent",
+                        color: row.using === which ? C.ink : C.inkSoft,
+                        fontWeight: row.using === which ? 600 : 400
+                      }}
+                    >
+                      <span style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: 0.4, color: C.inkMute, textTransform: "uppercase" }}>
+                        {which === "original" ? "first draft" : "edited"}
+                      </span>
+                      <br />
+                      {(which === "original" ? row.original : row.edited) || "(empty)"}
+                    </button>
+                  ))}
+                </div>
+              ))}
+            </div>
           </div>
         )}
 

@@ -221,20 +221,54 @@ describe("humanizeNote", () => {
   const report = (score: number) => ({ score, findings: [] });
 
   it("names the improvement when the score rises", () => {
-    expect(humanizeNote({ value: 1, before: report(70), after: report(90), applied: true })).toMatch(/70 to 90/);
+    expect(humanizeNote({ value: 1, draft: 1, before: report(70), after: report(90), applied: true })).toMatch(/70 to 90/);
   });
 
   it("says so plainly when the score held", () => {
-    expect(humanizeNote({ value: 1, before: report(88), after: report(88), applied: true })).toMatch(/held at 88/);
+    expect(humanizeNote({ value: 1, draft: 1, before: report(88), after: report(88), applied: true })).toMatch(/held at 88/);
   });
 
   it("does not hide a pass that made things worse", () => {
-    expect(humanizeNote({ value: 1, before: report(90), after: report(80), applied: true })).toMatch(/90 to 80/);
+    expect(humanizeNote({ value: 1, draft: 1, before: report(90), after: report(80), applied: true })).toMatch(/90 to 80/);
   });
 
   it("explains a skip", () => {
-    expect(humanizeNote({ value: 1, before: report(90), after: report(90), applied: false, note: "it broke" })).toBe(
+    expect(humanizeNote({ value: 1, draft: 1, before: report(90), after: report(90), applied: false, note: "it broke" })).toBe(
       "Edit pass skipped: it broke."
     );
+  });
+});
+
+// The draft is returned alongside the result so the UI can show what the edit
+// pass changed and offer to keep the original wording of a single slide.
+describe("the draft comes back for diffing", () => {
+  it("returns what went in when the pass applied", async () => {
+    const rewritten = {
+      cover: "Culture is what people *do*",
+      slides: [
+        { title: "The survey and the logs disagree", body: "The score said ownership. The logs did not." },
+        { title: "Behaviour is the honest record", body: "Reported and observed are different facts." }
+      ],
+      cta: "See how we read it"
+    };
+    mockFetch([{ text: JSON.stringify(rewritten) }]);
+    const original = deck();
+    const r = await humanizeDeck(original);
+    expect(r.draft).toEqual(original);
+    expect(r.value).not.toEqual(original);
+  });
+
+  it("returns draft equal to value when the pass was skipped", async () => {
+    mockFetch([{ status: 400 }]);
+    const r = await humanizeDeck(deck());
+    expect(r.draft).toEqual(r.value);
+  });
+
+  it("does the same for text", async () => {
+    const draft = "A first sentence that is long enough to survive the length guard on this pass.";
+    mockFetch([{ text: "A rewritten sentence that is also long enough to survive the length guard here." }]);
+    const r = await humanizeText(draft);
+    expect(r.draft).toBe(draft);
+    expect(r.value).not.toBe(draft);
   });
 });

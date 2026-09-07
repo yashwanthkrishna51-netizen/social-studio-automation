@@ -3,6 +3,11 @@
 // a mistake that costs real money, so nothing in this file touches I/O.
 
 export const MODEL_ALLOWLIST = [
+  // Opus is allowed for ONE task: the line-editing pass. Prose voice is where
+  // model tiers separate most sharply, and that pass is the call where the copy
+  // either starts sounding like a person or does not. Everything else stays on
+  // sonnet — see DEFAULT_MODEL_FOR_TASK, which is what actually decides.
+  "claude-opus-5",
   "claude-sonnet-5",
   "claude-sonnet-4-6",
   "claude-haiku-4-5",
@@ -40,9 +45,15 @@ export const DEFAULT_MODEL_FOR_TASK: Record<Task, AllowedModel> = {
   verify: "claude-sonnet-5",
   designNote: "claude-haiku-4-5",
   calendarPlan: "claude-sonnet-5",
-  // The pass that decides whether the copy reads as human. Judgment-heavy, and
-  // the one call in the app where a weaker model shows immediately.
-  humanize: "claude-sonnet-5"
+  // The pass that decides whether the copy reads as human, and the only task on
+  // Opus. Judgment-heavy: it holds a draft, a set of human writing samples and a
+  // list of faults at once, then decides which sentences to break. That is the
+  // one call in the app where a weaker model shows immediately, and at roughly
+  // two extra cents a deck it is the cheapest quality lever available.
+  //
+  // Caches are model-scoped, so drafting and editing now hold separate cache
+  // entries. Nothing is lost by that: they already build separate system blocks.
+  humanize: "claude-opus-5"
 };
 
 /**
@@ -99,7 +110,14 @@ export const THINKING_FOR_TASK: Record<Task, ThinkingConfig> = {
   humanize: { type: "adaptive" }
 };
 
-/** Only sent when the task's thinking is on. Omitted otherwise. */
+/**
+ * Only sent when the task's thinking is on. Omitted otherwise.
+ *
+ * This is the dial to reach for FIRST if the copy still reads flat. Raising
+ * humanize to "medium" buys a longer look at the draft against the samples for a
+ * few more output tokens, and it is a cheaper experiment than changing models
+ * again or rewriting the prompt.
+ */
 export const EFFORT_FOR_TASK: Partial<Record<Task, "low" | "medium" | "high">> = {
   humanize: "low"
 };
@@ -197,6 +215,7 @@ export function searchToolLadder(model: AllowedModel): Array<Record<string, unkn
 
 /** USD per 1M tokens. Keep in sync with MODEL_ALLOWLIST. */
 export const PRICING: Record<AllowedModel, { in: number; out: number; cacheWrite: number; cacheRead: number }> = {
+  "claude-opus-5": { in: 5, out: 25, cacheWrite: 6.25, cacheRead: 0.5 },
   "claude-sonnet-5": { in: 2, out: 10, cacheWrite: 2.5, cacheRead: 0.2 },
   "claude-sonnet-4-6": { in: 3, out: 15, cacheWrite: 3.75, cacheRead: 0.3 },
   "claude-haiku-4-5": { in: 1, out: 5, cacheWrite: 1.25, cacheRead: 0.1 },

@@ -21,6 +21,11 @@ import type { VoiceSample } from "./voiceSamples";
 export interface HumanizeResult<T> {
   /** The rewritten value, or the original draft when the pass could not run. */
   value: T;
+  /**
+   * What went in, so a caller can show what the pass changed without holding on
+   * to the pass-one value itself. Equal to `value` when the pass did not run.
+   */
+  draft: T;
   before: SlopReport;
   after: SlopReport;
   applied: boolean;
@@ -30,6 +35,7 @@ export interface HumanizeResult<T> {
 
 const failed = <T,>(value: T, before: SlopReport, note: string): HumanizeResult<T> => ({
   value,
+  draft: value,
   before,
   after: before,
   applied: false,
@@ -82,7 +88,7 @@ export async function humanizeDeck(
       }),
       cta: typeof raw.cta === "string" && raw.cta.trim() ? raw.cta : draft.cta
     };
-    return { value, before, after: lintContent(value), applied: true };
+    return { value, draft, before, after: lintContent(value), applied: true };
   } catch (e) {
     return failed(draft, before, e instanceof Error ? e.message : "the edit pass failed");
   }
@@ -111,7 +117,7 @@ export async function humanizeText(
     if (!value || value.length < draft.trim().length * 0.5) {
       return failed(draft, before, "the edit pass returned far less text than the draft, so the original was kept");
     }
-    return { value, before, after: lintText(value), applied: true };
+    return { value, draft, before, after: lintText(value), applied: true };
   } catch (e) {
     return failed(draft, before, e instanceof Error ? e.message : "the edit pass failed");
   }
@@ -155,7 +161,7 @@ export async function humanizePlanTopics<T extends PlanItemLike>(
       const t = raw.items[i]?.topic;
       return typeof t === "string" && t.trim() ? { ...item, topic: t.trim() } : item;
     });
-    return { value, before, after: lintTopics(value.map((i) => i.topic)), applied: true };
+    return { value, draft: items, before, after: lintTopics(value.map((i) => i.topic)), applied: true };
   } catch (e) {
     return failed(items, before, e instanceof Error ? e.message : "the edit pass failed");
   }

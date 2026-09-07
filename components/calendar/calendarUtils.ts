@@ -269,6 +269,8 @@ export function buildStudioHref(item: {
   id?: string;
   set?: string;
   style?: string;
+  /** Whose voice the post is in. The Studio uses it to pick that person's samples. */
+  platform?: string;
 }): string {
   const p = new URLSearchParams({
     topic: item.topic || item.title || "",
@@ -278,6 +280,10 @@ export function buildStudioHref(item: {
   });
   if (item.set) p.set("set", item.set);
   if (item.style) p.set("style", item.style);
+  // The calendar already knows who is publishing. Carrying it across means a
+  // deck opened from a calendar item is written in that person's voice rather
+  // than defaulting to the company page.
+  if (item.platform) p.set("channel", item.platform);
   return `/?${p.toString()}`;
 }
 

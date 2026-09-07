@@ -86,8 +86,12 @@ describe("model configuration", () => {
     expect(PRICING["claude-sonnet-5"].out).toBeLessThan(PRICING["claude-sonnet-4-6"].out);
   });
 
-  it("rejects anything outside the allowlist, including opus", () => {
-    expect(isAllowedModel("claude-opus-5")).toBe(false);
+  it("rejects anything outside the allowlist", () => {
+    // claude-opus-5 was on this list as a REJECTED model until the edit pass
+    // moved onto it. The allowlist is still closed; opus is not a wildcard.
+    expect(isAllowedModel("claude-opus-4-8")).toBe(false);
+    expect(isAllowedModel("claude-opus-5-20260401")).toBe(false);
+    expect(isAllowedModel("gpt-4")).toBe(false);
     expect(isAllowedModel("")).toBe(false);
   });
 });
@@ -255,7 +259,7 @@ describe("calendarPlan has room for the retry that exists to save it", () => {
 describe("the humanize pass", () => {
   it("is a real task the route will accept", () => {
     expect(TASKS).toContain("humanize");
-    expect(DEFAULT_MODEL_FOR_TASK.humanize).toBe("claude-sonnet-5");
+    expect(isAllowedModel(DEFAULT_MODEL_FOR_TASK.humanize)).toBe(true);
   });
 
   it("is the only task that thinks", () => {
@@ -290,5 +294,40 @@ describe("the humanize pass", () => {
 
   it("cannot search", () => {
     expect(SEARCH_ALLOWED_TASKS).not.toContain("humanize");
+  });
+});
+
+describe("Opus on the edit pass", () => {
+  it("is allowlisted so the route will accept it", () => {
+    expect(isAllowedModel("claude-opus-5")).toBe(true);
+  });
+
+  it("is what the humanize task actually runs on", () => {
+    expect(DEFAULT_MODEL_FOR_TASK.humanize).toBe("claude-opus-5");
+  });
+
+  it("is the only task on Opus", () => {
+    const onOpus = TASKS.filter((t) => DEFAULT_MODEL_FOR_TASK[t].startsWith("claude-opus"));
+    expect(onOpus).toEqual(["humanize"]);
+  });
+
+  it("is priced, so the spend log is not silently wrong", () => {
+    // costUsd reads PRICING by model. A missing row would throw or, worse,
+    // record every Opus call at zero and make the bill invisible.
+    expect(PRICING["claude-opus-5"]).toEqual({ in: 5, out: 25, cacheWrite: 6.25, cacheRead: 0.5 });
+  });
+
+  it("prices a realistic edit pass at a few cents", () => {
+    const cost = costUsd(
+      "claude-opus-5",
+      { input_tokens: 361, output_tokens: 1200, cache_read_input_tokens: 955 },
+      0
+    );
+    expect(cost).toBeGreaterThan(0.02);
+    expect(cost).toBeLessThan(0.05);
+  });
+
+  it("prices every allowlisted model, with no gaps", () => {
+    for (const m of MODEL_ALLOWLIST) expect(PRICING[m], `${m} has no price`).toBeTruthy();
   });
 });

@@ -310,7 +310,9 @@ export function ContentEditorModal({
       n: item?.n,
       id: item?.id,
       set: item?.set,
-      style: item?.style
+      style: item?.style,
+      // From the form, not the saved row, so the link matches what is on screen.
+      platform
     });
   }
 

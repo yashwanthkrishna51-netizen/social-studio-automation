@@ -231,3 +231,32 @@ describe("buildStudioHref", () => {
     expect(q(buildStudioHref({ id: "a", set: "magazine", style: "bold" })).get("set")).toBe("magazine");
   });
 });
+
+// The calendar already knows who is publishing. Carrying it to the Studio means
+// a deck opened from a calendar item is written in that person's voice instead
+// of defaulting to the company page.
+describe("buildStudioHref carries the publishing identity", () => {
+  const paramsOf = (href: string) => new URLSearchParams(href.replace(/^\/\?/, ""));
+
+  it("passes the platform through as the channel", () => {
+    const p = paramsOf(buildStudioHref({ topic: "Succession", contentType: "Carousel", pillar: "Culture", platform: "Lokesh" }));
+    expect(p.get("channel")).toBe("Lokesh");
+  });
+
+  it("omits the channel entirely when the item has no platform", () => {
+    const p = paramsOf(buildStudioHref({ topic: "Succession", contentType: "Carousel", pillar: "Culture" }));
+    expect(p.has("channel")).toBe(false);
+  });
+
+  it("still carries everything it carried before", () => {
+    const p = paramsOf(
+      buildStudioHref({ topic: "Succession", contentType: "Carousel", pillar: "Culture", n: 12, set: "editorial", style: "signals", platform: "Harpreet" })
+    );
+    expect(p.get("topic")).toBe("Succession");
+    expect(p.get("format")).toBe("Carousel");
+    expect(p.get("pillar")).toBe("Culture");
+    expect(p.get("n")).toBe("12");
+    expect(p.get("set")).toBe("editorial");
+    expect(p.get("style")).toBe("signals");
+  });
+});
