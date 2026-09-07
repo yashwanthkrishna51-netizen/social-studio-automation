@@ -13,7 +13,7 @@
 //     ported in this pass — flagged in README as the one remaining gap.
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { useSession, signOut } from "next-auth/react";
 import { C, GRAD, FONT, DISPLAY_FONT } from "@/lib/tokens";
@@ -38,6 +38,19 @@ import {
   groundingDefault
 } from "@/lib/promptBuilders";
 import { callClaudeJSON, callClaudeText, FAST_MODEL } from "@/lib/claudeClient";
+import {
+  coerceSamples,
+  mergeSamples,
+  newSample,
+  pickSamples,
+  samplesFromTemplate,
+  SAMPLE_KINDS,
+  type SampleKind,
+  type VoiceSample
+} from "@/lib/voiceSamples";
+import { humanizeDeck, humanizeNote, humanizeText } from "@/lib/humanizePass";
+import { lintContent } from "@/lib/slopLint";
+import { CHANNEL_IDS, type ChannelId } from "@/lib/founderProfiles";
 import { storeGet, storeSet, storePeek } from "@/lib/storeClient";
 import { exportPdf, exportFramesPdf, exportPanorama, exportStrip, exportPNG, saveBlobAs } from "@/lib/exportPipeline";
 import { SocialPreview, type PreviewPage } from "@/components/SocialPreview";
@@ -105,6 +118,18 @@ export default function Studio() {
   const [design, setDesignLocal] = useState<Required<SlideDesign>>(DEFAULT_DESIGN);
   const [housePrefs, setHousePrefsLocal] = useState("");
   const [styleMem, setStyleMem] = useState<StyleExample[]>([]);
+  // Real human writing the model imitates. Distinct from styleMem, which is the
+  // app's own past output — see lib/voiceSamples.ts for why conflating the two
+  // is what made everything sound machine-written.
+  const [voiceSamples, setVoiceSamples] = useState<VoiceSample[]>([]);
+  const [sampleDraft, setSampleDraft] = useState("");
+  const [sampleChannel, setSampleChannel] = useState<ChannelId>("Kognoz page");
+  const [sampleKind, setSampleKind] = useState<SampleKind>("post");
+  const [showSamples, setShowSamples] = useState(false);
+  // What the second pass did. The score itself is derived below, not stored: a
+  // stored score goes stale the moment someone edits a field by hand, and the
+  // panel would then be reporting on text that is no longer on screen.
+  const [passNote, setPassNote] = useState("");
   const [designNote, setDesignNote] = useState("");
   const [designBusy, setDesignBusy] = useState(false);
   const [lookI, setLookI] = useState(0);
@@ -207,14 +232,16 @@ export default function Studio() {
   // Load shared design/house-prefs/style-memory once on mount (PRD §3.2).
   useEffect(() => {
     (async () => {
-      const [d, hp, sm] = await Promise.all([
+      const [d, hp, sm, vs] = await Promise.all([
         storeGet<Partial<SlideDesign>>("kognoz-design").then((r) => r.value),
         storeGet<string>("kognoz-house-prefs").then((r) => r.value),
-        storeGet<StyleExample[]>("kognoz-style-memory").then((r) => r.value)
+        storeGet<StyleExample[]>("kognoz-style-memory").then((r) => r.value),
+        storeGet<unknown>("kognoz-voice-samples").then((r) => r.value)
       ]);
       if (d && Object.keys(d).length) setDesignLocal((cur) => ({ ...cur, ...d }));
       if (typeof hp === "string") setHousePrefsLocal(hp);
       if (Array.isArray(sm)) setStyleMem(sm);
+      setVoiceSamples(coerceSamples(vs));
     })();
   }, []);
 
@@ -255,11 +282,57 @@ export default function Studio() {
     setError("");
     saveHousePrefs((housePrefs ? housePrefs + "\n" : "") + line);
   };
+  /**
+   * Save the deck on screen as a STRUCTURAL reference for future generations.
+   *
+   * This used to fire automatically on every PNG export, and the prompt then told
+   * the model to "match their voice" against it. Exporting is not approval, and
+   * the saved text is the app's own machine writing, so each generation was
+   * imitating the previous one's voice — six slots deep, compounding. That is the
+   * single largest reason the output read as AI.
+   *
+   * It is now an explicit button, and the prompt block it feeds says plainly that
+   * these are machine-written and are for slide count and field length only. Voice
+   * comes from voiceSamples, which is human writing.
+   */
   const saveStyleExample = () => {
     const ex: StyleExample = { format, cover, slides: slides.slice(0, 6), cta };
     const next = [...styleMem.filter((e) => e.cover !== cover), ex].slice(-6);
     setStyleMem(next);
     storeSet("kognoz-style-memory", next);
+  };
+
+  const persistSamples = (next: VoiceSample[]) => {
+    setVoiceSamples(next);
+    storeSet("kognoz-voice-samples", next);
+  };
+
+  const addSample = () => {
+    const text = sampleDraft.trim();
+    if (!text) return;
+    if (text.length < 140) {
+      setError("That is too short to teach a voice. Paste the whole post, not a line from it.");
+      return;
+    }
+    if (voiceSamples.some((v) => v.text.trim() === text)) {
+      setError("That sample is already saved.");
+      return;
+    }
+    setError("");
+    persistSamples([...voiceSamples, newSample({ channel: sampleChannel, kind: sampleKind, text })]);
+    setSampleDraft("");
+  };
+
+  const removeSample = (id: string) => persistSamples(voiceSamples.filter((v) => v.id !== id));
+
+  const importTemplateSamples = () => {
+    const next = mergeSamples(voiceSamples, samplesFromTemplate());
+    if (next.length === voiceSamples.length) {
+      setError("Those are already imported.");
+      return;
+    }
+    setError("");
+    persistSamples(next);
   };
 
   const updSlide = (i: number, key: "title" | "body", val: string) =>
@@ -306,6 +379,18 @@ export default function Studio() {
   // rather than stored: the topic can arrive after the draft does (a calendar link), so a
   // value computed once on mount would always say "no mismatch".
   const draftTopicMismatch = Boolean(article && draftTopic && topic.trim() && !sameTopic(draftTopic, topic));
+
+  /**
+   * The automated style check, recomputed from whatever is on screen.
+   *
+   * Derived rather than stored so a hand edit updates it immediately: a score
+   * captured at generation time would keep describing text the user has since
+   * rewritten. Pure and cheap — regex passes over a few hundred characters.
+   */
+  const styleReport = useMemo(
+    () => (cover || slides.length ? lintContent({ cover, slides, cta }) : null),
+    [cover, slides, cta]
+  );
 
   const accent = design.accent || PILLARS[pillar] || C.blue;
   const fmt = FORMATS[format];
@@ -451,29 +536,49 @@ export default function Studio() {
     if (!gTopic.trim() || loading || modLoading) return;
     setLoading(true);
     setError("");
+    // Clear before the call, not after: a failed generation would otherwise leave
+    // the previous deck's edit-pass note sitting under the new topic.
+    setPassNote("");
     try {
-      const { prompt, useSearch } = buildGeneratePrompt({
+      // Chosen once and used for both passes, so the draft and the line edit are
+      // measured against the same writing.
+      const samples = pickSamples(voiceSamples, { kind: "slide", seed });
+      const { system, user, useSearch } = buildGeneratePrompt({
         topic: gTopic,
         pillar: gPillar,
         format: gFormat,
         ideaStyle,
         housePrefs,
         styleMem,
+        voiceSamples: samples,
+        seed,
         fresh,
         grounded: gGrounded
       });
+      const bodyBudget = bodyBudgetFor(gFormat);
       // Per-format body budget: without it, a Story asking for three paragraphs gets
       // cut to 230 characters on arrival and the page looks unchanged.
-      const parsed = coerceContent(await callClaudeJSON("generate", prompt, { useSearch }), undefined, {
-        body: bodyBudgetFor(gFormat)
+      const parsed = coerceContent(await callClaudeJSON("generate", { system, user }, { useSearch }), undefined, {
+        body: bodyBudget
       });
       if (gFormat === "Idea Deck") parsed.slides = applyIdeaDeckKickers(parsed.slides, ideaStyle);
       if (gFormat === "Stat Card" && parsed.slides[0]) parsed.slides[0] = applyStatCardHygiene(parsed.slides[0]);
 
+      // Second pass: the line edit. It never throws — a failure returns the draft
+      // untouched, because the draft is already paid for and already usable.
+      const edited = await humanizeDeck(parsed, { voiceSamples: samples, housePrefs });
+      setPassNote(humanizeNote(edited));
+
+      // Back through the quality firewall: the edit pass is a model reply like any
+      // other and must not be trusted with URLs, dashes or character budgets.
+      const final = coerceContent(edited.value, parsed.slides.length, { body: bodyBudget });
+      if (gFormat === "Idea Deck") final.slides = applyIdeaDeckKickers(final.slides, ideaStyle);
+      if (gFormat === "Stat Card" && final.slides[0]) final.slides[0] = applyStatCardHygiene(final.slides[0]);
+
       setEyebrow(gPillar);
-      setCover(parsed.cover);
-      setSlides(parsed.slides);
-      setCta(parsed.cta || "Start the conversation");
+      setCover(final.cover);
+      setSlides(final.slides);
+      setCta(final.cta || "Start the conversation");
       bumpReplay();
       setImages({});
       setScales({});
@@ -531,11 +636,25 @@ export default function Studio() {
     setArtBusy(true);
     setError("");
     try {
-      const prompt = buildArticlePrompt({ topic, pillar, instruction, currentArticle: article });
+      const samples = pickSamples(voiceSamples, { kind: "article", seed });
+      const prompt = buildArticlePrompt({ topic, pillar, instruction, currentArticle: article, voiceSamples: samples, seed });
       const text = await callClaudeText("article", prompt, { model: instruction && instruction.trim() ? FAST_MODEL : undefined, maxTokens: 2600 });
+
+      // Second pass. Skipped on a targeted revision: the team asked for one
+      // specific change, and a line edit on top of it would quietly rewrite the
+      // rest of a piece they had already approved.
+      let finalText = text.trim();
+      if (instruction && instruction.trim()) {
+        setPassNote("");
+      } else {
+        const edited = await humanizeText(finalText, { voiceSamples: samples, maxTokens: 6000 });
+        finalText = edited.value.trim();
+        setPassNote(humanizeNote(edited));
+      }
+
       setArticleUndo(article ? { text: article, label: instruction?.trim() ? "revision" : "rewrite" } : null);
-      setArticle(text.trim());
-      saveArticleDraft(text.trim());
+      setArticle(finalText);
+      saveArticleDraft(finalText);
       setDraftTopic(topic);
       setStaleArticle(false);
       setArtInstr("");
@@ -747,7 +866,6 @@ export default function Studio() {
         );
         return;
       }
-      saveStyleExample();
     } finally {
       setExportBusy(false);
     }
@@ -772,10 +890,6 @@ export default function Studio() {
           `${failed.length} of ${deck.length} slides didn't export (${failed.join(", ")}). ` +
             `The rest downloaded. Try those again individually, or screenshot the preview.`
         );
-      } else {
-        // Once per export, not once per slide: this was firing a store write for every
-        // slide in the deck, all of them built from the same stale closure.
-        saveStyleExample();
       }
     } finally {
       setExportBusy(false);
@@ -1184,6 +1298,33 @@ export default function Studio() {
         )}
         {error && <div style={{ fontFamily: font, fontSize: 12, color: "#B4442E", marginTop: 10, lineHeight: 1.5 }}>{error}</div>}
 
+        {/*
+          What the automated style check makes of what is on screen. It is a nudge,
+          not a verdict: the lexical findings (a banned word, an em dash) are
+          objective, the rhythm ones are hints. Shown because the ban list used to
+          be prompt text that nothing ever verified, so a violation shipped silently.
+        */}
+        {styleReport && (
+          <div style={{ marginTop: 10, fontFamily: font, fontSize: 11.5, lineHeight: 1.55 }}>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+              <span style={{ fontWeight: 700, color: styleReport.score >= 85 ? C.teal : styleReport.score >= 60 ? "#B8860B" : "#B4442E" }}>
+                Style check {styleReport.score}/100
+              </span>
+              {passNote && <span style={{ color: C.inkMute }}>{passNote}</span>}
+            </div>
+            {styleReport.findings.length > 0 && (
+              <ul style={{ margin: "5px 0 0", paddingLeft: 16, color: C.inkSoft }}>
+                {styleReport.findings.slice(0, 5).map((f, i) => (
+                  <li key={i} style={{ marginBottom: 2 }}>
+                    {f.where ? `${f.where}: ` : ""}
+                    {f.message}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
         {format === "Article Cover" && (
           <div style={{ marginTop: 14, border: `1px solid ${C.line}`, borderRadius: 12, padding: 14, background: C.off }}>
             <span style={label}>The article itself · the cover is the billboard, this is the asset</span>
@@ -1351,7 +1492,7 @@ export default function Studio() {
             {loading ? "Regenerating…" : "⟳ Regenerate afresh"}
           </button>
           <div style={{ fontFamily: font, fontSize: 11, color: C.inkMute, marginTop: 7, lineHeight: 1.5 }}>
-            Revise refines the current draft. Regenerate afresh discards it: a mandated new angle, a new layout deal, and earlier approved examples ignored for that run. For design alone, "Next look" under the preview re-deals layouts without touching the words.
+            Revise refines the current draft. Regenerate afresh discards it: a mandated new angle, a new layout deal, and earlier shape references ignored for that run. For design alone, "Next look" under the preview re-deals layouts without touching the words.
           </div>
         </div>
 
@@ -1423,12 +1564,81 @@ export default function Studio() {
         <div style={{ marginTop: 14, padding: "14px 14px 12px", background: C.mist, borderRadius: 10, border: `1px solid ${C.line}` }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
             <span style={{ ...label, marginBottom: 0 }}>House style · applied to every generation</span>
-            <span style={{ fontFamily: font, fontSize: 10.5, fontWeight: 700, color: C.teal }}>
-              {styleMem.length} approved example{styleMem.length === 1 ? "" : "s"}
-            </span>
+            <button type="button" onClick={saveStyleExample} title="Save this deck's shape — slide count and how much text sits in each field — as a reference for future drafts. Its wording is not copied." style={{ fontFamily: font, fontSize: 10.5, fontWeight: 700, color: C.teal, background: "none", border: "none", cursor: "pointer", padding: 0 }}>
+              {styleMem.length} shape reference{styleMem.length === 1 ? "" : "s"} · save this one
+            </button>
           </div>
           <textarea value={housePrefs} onChange={(e) => setHousePrefsLocal(e.target.value)} onBlur={(e) => saveHousePrefs(e.target.value)} rows={3} placeholder='Standing notes Claude follows on every draft. Your revision instructions land here automatically; edit or prune anytime.' style={{ ...inputStyle, background: C.white, fontSize: 12.5 }} />
-          <div style={{ fontFamily: font, fontSize: 10.5, color: C.inkMute, marginTop: 6, lineHeight: 1.5 }}>Only rules you save with &quot;+ Rule&quot; land here, so one-off instructions never pollute future drafts. Downloaded finals still become approved examples automatically.</div>
+          <div style={{ fontFamily: font, fontSize: 10.5, color: C.inkMute, marginTop: 6, lineHeight: 1.5 }}>Only rules you save with &quot;+ Rule&quot; land here, so one-off instructions never pollute future drafts. Shape references are saved by hand now: downloading a deck no longer files it as an example to imitate.</div>
+        </div>
+
+        {/*
+          The voice corpus. This is the lever that decides whether the output reads
+          as a person, so it sits beside House style rather than behind a settings
+          page. What goes in here is real published writing; what comes out of the
+          generator is not, which is why the two stores are kept apart.
+        */}
+        <div style={{ marginTop: 14, padding: "14px 14px 12px", background: C.mist, borderRadius: 10, border: `1px solid ${C.line}` }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+            <span style={{ ...label, marginBottom: 0 }}>Voice samples · real writing to imitate</span>
+            <button type="button" onClick={() => setShowSamples((v) => !v)} style={{ fontFamily: font, fontSize: 10.5, fontWeight: 700, color: voiceSamples.length ? C.teal : "#C4553D", background: "none", border: "none", cursor: "pointer", padding: 0 }}>
+              {voiceSamples.length} saved · {showSamples ? "hide" : "manage"}
+            </button>
+          </div>
+
+          {!voiceSamples.length && (
+            <div style={{ fontFamily: font, fontSize: 11.5, color: "#C4553D", lineHeight: 1.5, marginBottom: 8 }}>
+              Nothing here yet. Until real posts are pasted in, drafts have no human writing to measure themselves against and will keep reading as machine-written.
+            </div>
+          )}
+
+          {showSamples && (
+            <>
+              <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+                <select value={sampleChannel} onChange={(e) => setSampleChannel(e.target.value as ChannelId)} style={{ ...inputStyle, fontSize: 12, padding: "7px 8px", marginBottom: 0, flex: 1 }}>
+                  {CHANNEL_IDS.map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+                <select value={sampleKind} onChange={(e) => setSampleKind(e.target.value as SampleKind)} style={{ ...inputStyle, fontSize: 12, padding: "7px 8px", marginBottom: 0, width: 96 }}>
+                  {SAMPLE_KINDS.map((k) => (
+                    <option key={k} value={k}>{k}</option>
+                  ))}
+                </select>
+              </div>
+              <textarea value={sampleDraft} onChange={(e) => setSampleDraft(e.target.value)} rows={4} placeholder="Paste one real published post, whole. Not a summary of it, and not something the tool wrote." style={{ ...inputStyle, background: C.white, fontSize: 12.5, marginBottom: 6 }} />
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                <button type="button" onClick={addSample} disabled={!sampleDraft.trim()} style={{ fontFamily: font, fontSize: 11.5, fontWeight: 700, padding: "7px 12px", borderRadius: 7, border: `1px solid ${C.line}`, background: sampleDraft.trim() ? C.white : C.mist, color: C.ink, cursor: sampleDraft.trim() ? "pointer" : "default" }}>
+                  Add sample
+                </button>
+                <button type="button" onClick={importTemplateSamples} title="Import the hand-written copy from the agreed editorial plan already in this repo" style={{ fontFamily: font, fontSize: 11.5, fontWeight: 600, padding: "7px 12px", borderRadius: 7, border: `1px solid ${C.line}`, background: C.white, color: C.inkSoft, cursor: "pointer" }}>
+                  Import from the editorial plan
+                </button>
+              </div>
+
+              <div style={{ marginTop: 10, maxHeight: 220, overflowY: "auto" }}>
+                {voiceSamples.map((v) => (
+                  <div key={v.id} style={{ display: "flex", gap: 8, alignItems: "flex-start", padding: "7px 0", borderTop: `1px solid ${C.line}` }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontFamily: font, fontSize: 10, fontWeight: 700, color: C.teal, textTransform: "uppercase", letterSpacing: 0.4 }}>
+                        {v.channel} · {v.kind}
+                      </div>
+                      <div style={{ fontFamily: font, fontSize: 11.5, color: C.inkSoft, lineHeight: 1.45 }}>
+                        {v.text.length > 150 ? v.text.slice(0, 150) + "…" : v.text}
+                      </div>
+                    </div>
+                    <button type="button" onClick={() => removeSample(v.id)} title="Remove this sample" style={{ fontFamily: font, fontSize: 14, lineHeight: 1, color: C.inkMute, background: "none", border: "none", cursor: "pointer", padding: 2 }}>
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
+          <div style={{ fontFamily: font, fontSize: 10.5, color: C.inkMute, marginTop: 6, lineHeight: 1.5 }}>
+            Every draft is written once, then line-edited a second time against these samples. Paste posts people actually published; a sample the tool wrote teaches it to sound like itself.
+          </div>
         </div>
 
         <div style={{ height: 1, background: C.line, margin: "24px 0 20px" }} />

@@ -13,11 +13,17 @@ export function getSupabaseServerClient() {
   return createClient(url, key, { auth: { persistSession: false } });
 }
 
+// Keep in sync with the CHECK constraint on store.key — schema.sql and
+// supabase/migrations/2026-09-04_voice_samples.sql. A key added here but not
+// there is accepted by the route and rejected by the database.
 export const STORE_KEYS = [
   "kognoz-calendar",
   "kognoz-house-prefs",
   "kognoz-style-memory",
-  "kognoz-design"
+  "kognoz-design",
+  // Real, human-written posts the model imitates. See lib/voiceSamples.ts for
+  // why this is not the same thing as kognoz-style-memory.
+  "kognoz-voice-samples"
 ] as const;
 
 export type StoreKey = (typeof STORE_KEYS)[number];

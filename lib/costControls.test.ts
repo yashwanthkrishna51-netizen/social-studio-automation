@@ -13,7 +13,9 @@ import {
   searchCount,
   isAllowedModel,
   searchToolLadder,
-  THINKING
+  THINKING,
+  EFFORT_FOR_TASK,
+  thinkingFor
 } from "./costControls";
 
 describe("clampMaxTokens", () => {
@@ -243,5 +245,50 @@ describe("calendarPlan has room for the retry that exists to save it", () => {
   it("cannot search, so a month never becomes a grounded call by accident", () => {
     expect(SEARCH_ALLOWED_TASKS).not.toContain("calendarPlan");
     expect(clampMaxTokens("calendarPlan", undefined, true)).toBe(TOKENS.calendarPlan.def);
+  });
+});
+
+// The humanize pass is the one call in the app that runs with thinking on, and
+// thinking spends the same max_tokens budget as the answer. That combination is
+// exactly the truncation trap documented at the top of costControls.ts, so both
+// halves of the arrangement are pinned here.
+describe("the humanize pass", () => {
+  it("is a real task the route will accept", () => {
+    expect(TASKS).toContain("humanize");
+    expect(DEFAULT_MODEL_FOR_TASK.humanize).toBe("claude-sonnet-5");
+  });
+
+  it("is the only task that thinks", () => {
+    const thinking = TASKS.filter((t) => thinkingFor(t).type === "adaptive");
+    expect(thinking).toEqual(["humanize"]);
+  });
+
+  it("leaves every drafting task with thinking off", () => {
+    for (const t of TASKS.filter((x) => x !== "humanize")) {
+      expect(thinkingFor(t), `${t} should not think`).toEqual({ type: "disabled" });
+    }
+  });
+
+  it("sends effort only where thinking is on", () => {
+    for (const t of TASKS) {
+      if (thinkingFor(t).type === "disabled") expect(EFFORT_FOR_TASK[t]).toBeUndefined();
+    }
+    expect(EFFORT_FOR_TASK.humanize).toBe("low");
+  });
+
+  it("leaves room for the roomier retry rather than clamping it away", () => {
+    // def x 1.75 is what claudeClient asks for after a truncation. If the cap
+    // sits below that, the retry truncates identically and buys nothing.
+    const t = TOKENS.humanize;
+    expect(t.cap).toBeGreaterThanOrEqual(Math.round(t.def * 1.75));
+  });
+
+  it("has headroom for the largest payload it handles", () => {
+    // Thirty-six rewritten calendar topics, plus thinking tokens on top.
+    expect(clampMaxTokens("humanize", 10000)).toBe(10000);
+  });
+
+  it("cannot search", () => {
+    expect(SEARCH_ALLOWED_TASKS).not.toContain("humanize");
   });
 });

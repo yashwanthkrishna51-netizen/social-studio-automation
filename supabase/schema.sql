@@ -48,8 +48,10 @@ alter table users enable row level security;
 -- Replaces artifact window.storage with shared server storage (PRD §3.2).
 -- Same key semantics as v3: GET/PUT /api/store?key=... , JSON values, last-write-wins.
 create table if not exists store (
+  -- Keep in sync with STORE_KEYS in lib/supabase.ts. An existing database is
+  -- widened by supabase/migrations/2026-09-04_voice_samples.sql, not by this file.
   key text primary key check (
-    key in ('kognoz-calendar', 'kognoz-house-prefs', 'kognoz-style-memory', 'kognoz-design')
+    key in ('kognoz-calendar', 'kognoz-house-prefs', 'kognoz-style-memory', 'kognoz-design', 'kognoz-voice-samples')
   ),
   value jsonb not null,
   updated_at timestamptz not null default now(),

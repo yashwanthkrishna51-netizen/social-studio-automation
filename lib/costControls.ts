@@ -10,8 +10,25 @@ export const MODEL_ALLOWLIST = [
 ] as const;
 export type AllowedModel = (typeof MODEL_ALLOWLIST)[number];
 
-export type Task = "generate" | "revise" | "caption" | "article" | "verify" | "designNote" | "calendarPlan";
-export const TASKS: Task[] = ["generate", "revise", "caption", "article", "verify", "designNote", "calendarPlan"];
+export type Task =
+  | "generate"
+  | "revise"
+  | "caption"
+  | "article"
+  | "verify"
+  | "designNote"
+  | "calendarPlan"
+  | "humanize";
+export const TASKS: Task[] = [
+  "generate",
+  "revise",
+  "caption",
+  "article",
+  "verify",
+  "designNote",
+  "calendarPlan",
+  "humanize"
+];
 
 // claude-sonnet-5 is $2/$10 per MTok against claude-sonnet-4-6's $3/$15 — cheaper
 // and newer. 4.6 stays allowlisted purely as a rollback target.
@@ -22,7 +39,10 @@ export const DEFAULT_MODEL_FOR_TASK: Record<Task, AllowedModel> = {
   article: "claude-sonnet-5",
   verify: "claude-sonnet-5",
   designNote: "claude-haiku-4-5",
-  calendarPlan: "claude-sonnet-5"
+  calendarPlan: "claude-sonnet-5",
+  // The pass that decides whether the copy reads as human. Judgment-heavy, and
+  // the one call in the app where a weaker model shows immediately.
+  humanize: "claude-sonnet-5"
 };
 
 /**
@@ -48,6 +68,46 @@ export const DEFAULT_MODEL_FOR_TASK: Record<Task, AllowedModel> = {
  */
 export const THINKING: { type: "disabled" } = { type: "disabled" };
 
+export type ThinkingConfig = { type: "disabled" } | { type: "adaptive" };
+
+/**
+ * Thinking, per task. Off everywhere except the humanize pass.
+ *
+ * The reasoning in the block above still holds for drafting: those are short,
+ * tightly-specified writing tasks with hard per-field character limits, and
+ * paying output-token rates for reasoning that claudeClient then throws away is
+ * pure waste.
+ *
+ * Humanize is the exception, and it is the one place the cost buys something.
+ * That call has to hold a draft, a set of human writing samples and a list of
+ * faults in its head at once, then decide which sentences to break and which to
+ * leave. That is judgment, not transcription. It is also the call that replaces
+ * the old "draft first, then audit your draft" instruction, which was asking for
+ * exactly this and had nowhere to do it.
+ *
+ * `effort` is kept low deliberately: the task is bounded and the draft is
+ * already written, so this buys a scratchpad rather than a long deliberation.
+ */
+export const THINKING_FOR_TASK: Record<Task, ThinkingConfig> = {
+  generate: { type: "disabled" },
+  revise: { type: "disabled" },
+  caption: { type: "disabled" },
+  article: { type: "disabled" },
+  verify: { type: "disabled" },
+  designNote: { type: "disabled" },
+  calendarPlan: { type: "disabled" },
+  humanize: { type: "adaptive" }
+};
+
+/** Only sent when the task's thinking is on. Omitted otherwise. */
+export const EFFORT_FOR_TASK: Partial<Record<Task, "low" | "medium" | "high">> = {
+  humanize: "low"
+};
+
+export function thinkingFor(task: Task): ThinkingConfig {
+  return THINKING_FOR_TASK[task] ?? THINKING;
+}
+
 /**
  * Billing is on ACTUAL output_tokens, never on the cap. A generous cap therefore
  * costs nothing, while a tight one truncates mid-JSON and sends the client into a
@@ -71,7 +131,18 @@ export const TOKENS: Record<Task, { def: number; cap: number; groundedDef?: numb
   // is only real if the cap leaves room for it: at generate's 2000/2400 the roomier
   // retry gets clamped straight back to 2400 and truncates identically, buying a second
   // call for nothing. 4000 x 1.75 = 7000, comfortably inside 8000.
-  calendarPlan: { def: 4000, cap: 8000 }
+  calendarPlan: { def: 4000, cap: 8000 },
+  // One task, three very different payloads: a deck (~800 output tokens), a
+  // 1,200-word article (~2,000), or 36 rewritten calendar topics (~2,400). The
+  // caller asks for what it needs and clampMaxTokens holds the ceiling.
+  //
+  // The cap is high for two reasons that compound. Billing is on actual output,
+  // never on the cap, so headroom is free. And this is the one task with
+  // thinking ON, which spends the SAME max_tokens budget as the answer — the
+  // exact trap documented above, where a tight cap truncates the JSON and buys a
+  // second call for nothing. def x 1.75 = 7,000 stays well inside the cap, so
+  // claudeClient's roomier retry is real rather than clamped straight back.
+  humanize: { def: 4000, cap: 12000 }
 };
 
 // calendarPlan is deliberately absent: the founder research is already done and written

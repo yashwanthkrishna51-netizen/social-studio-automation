@@ -13,7 +13,8 @@ import {
   searchToolLadder,
   isAllowedModel,
   clampMaxTokens,
-  THINKING,
+  thinkingFor,
+  EFFORT_FOR_TASK,
   costUsd,
   searchCount,
   type AllowedModel,
@@ -34,6 +35,13 @@ export const maxDuration = 60;
 interface ClaudeRequestBody {
   task: Task;
   prompt: string;
+  /**
+   * The stable half of the prompt: brand canon, rules, voice samples. Sent as a
+   * real system block with cache_control so it is billed at cache-read rates
+   * after the first call. Optional — an older client that sends only `prompt`
+   * still works, it just pays full price.
+   */
+  system?: string;
   model?: string;
   maxTokens?: number;
   useSearch?: boolean;
@@ -53,7 +61,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const { task, prompt, useSearch = false } = body;
+  const { task, prompt, system, useSearch = false } = body;
 
   if (!TASKS.includes(task)) {
     return NextResponse.json({ error: `Unknown task: ${task}` }, { status: 400 });
@@ -140,14 +148,36 @@ export async function POST(req: NextRequest) {
   // `body.maxTokens` was unbounded — a client could post 200000.
   const maxTokens = clampMaxTokens(task, body.maxTokens, useSearch);
 
+  const thinking = thinkingFor(task);
+
   const anthropicBody: Record<string, unknown> = {
     model,
     max_tokens: maxTokens,
     // Explicit, not omitted. On sonnet-5 an absent `thinking` means adaptive
-    // thinking runs by default — see THINKING in lib/costControls.ts.
-    thinking: THINKING,
+    // thinking runs by default — see THINKING_FOR_TASK in lib/costControls.ts.
+    thinking,
     messages: [{ role: "user", content: prompt }]
   };
+
+  // Effort only means something when thinking is on; sending it alongside
+  // disabled thinking is at best noise.
+  const effort = thinking.type === "adaptive" ? EFFORT_FOR_TASK[task] : undefined;
+  if (effort) anthropicBody.output_config = { effort };
+
+  // The cacheable half. Every prompt in lib/promptBuilders.ts is split so that
+  // the brand canon, the rules and the voice samples land here and repeat
+  // byte-for-byte between calls, while the topic and the format contract stay in
+  // the user turn. Without this the whole prompt was one user message paid for in
+  // full every time, which is why the brand context had to stay thin.
+  //
+  // Caching is a prefix match, so a change anywhere in this block invalidates it.
+  // Watch cache_read_input_tokens in api_call_log: a steady zero means something
+  // volatile has leaked into the system half.
+  if (typeof system === "string" && system.trim()) {
+    anthropicBody.system = [
+      { type: "text", text: system, cache_control: { type: "ephemeral" } }
+    ];
+  }
 
   const ladder = useSearch ? searchToolLadder(model) : [];
   if (useSearch) anthropicBody.tools = [ladder[0]];

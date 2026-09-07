@@ -30,9 +30,31 @@
 // Hand-duplicated from costControls' `Task` rather than imported, because this file is
 // "use client" and that one is server-shared. The two can drift silently, so they are
 // changed together.
-export type ClaudeTask = "generate" | "revise" | "caption" | "article" | "verify" | "designNote" | "calendarPlan";
+export type ClaudeTask =
+  | "generate"
+  | "revise"
+  | "caption"
+  | "article"
+  | "verify"
+  | "designNote"
+  | "calendarPlan"
+  | "humanize";
 
 export const FAST_MODEL = "claude-haiku-4-5";
+
+/**
+ * A prompt in two halves. Structurally identical to `BuiltPrompt` in
+ * lib/promptBuilders.ts, redeclared here for the same reason ClaudeTask is:
+ * this file is "use client" and that one pulls in the whole brand canon, which
+ * has no business in the transport layer.
+ *
+ * `system` is the stable half and the route attaches cache_control to it, so
+ * anything volatile put in there quietly costs money on every call.
+ */
+export interface PromptParts {
+  system: string;
+  user: string;
+}
 
 const REQUEST_TIMEOUT_MS = 90_000;
 
@@ -66,7 +88,7 @@ export class ClaudeError extends Error {
   }
 }
 
-async function callProxy(task: ClaudeTask, prompt: string, opts: CallOpts = {}): Promise<ProxyResult> {
+async function callProxy(task: ClaudeTask, prompt: PromptParts, opts: CallOpts = {}): Promise<ProxyResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   let res: Response;
@@ -74,7 +96,14 @@ async function callProxy(task: ClaudeTask, prompt: string, opts: CallOpts = {}):
     res = await fetch("/api/claude", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task, prompt, model: opts.model, maxTokens: opts.maxTokens, useSearch: opts.useSearch }),
+      body: JSON.stringify({
+        task,
+        prompt: prompt.user,
+        system: prompt.system,
+        model: opts.model,
+        maxTokens: opts.maxTokens,
+        useSearch: opts.useSearch
+      }),
       signal: controller.signal
     });
   } catch (e) {
@@ -106,7 +135,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * One transport-level retry, for failures that cost nothing and may succeed on a
  * second try. 4xx never gets here.
  */
-async function callProxyResilient(task: ClaudeTask, prompt: string, opts: CallOpts): Promise<ProxyResult> {
+async function callProxyResilient(task: ClaudeTask, prompt: PromptParts, opts: CallOpts): Promise<ProxyResult> {
   try {
     return await callProxy(task, prompt, opts);
   } catch (e) {
@@ -124,7 +153,7 @@ const extractJson = (text: string) => {
   return JSON.parse(text.slice(a, b + 1));
 };
 
-export async function callClaudeJSON(task: ClaudeTask, prompt: string, opts: CallOpts = {}): Promise<any> {
+export async function callClaudeJSON(task: ClaudeTask, prompt: PromptParts, opts: CallOpts = {}): Promise<any> {
   const first = await callProxyResilient(task, prompt, opts);
   try {
     return extractJson(first.text);
@@ -143,16 +172,21 @@ export async function callClaudeJSON(task: ClaudeTask, prompt: string, opts: Cal
       }
     }
     // Complete but malformed — the only case a corrective nudge actually fixes.
+    // Appended to the USER half only. Adding it to the system half would change
+    // the cached prefix and throw away the cache entry on every corrective retry.
     const fixed = await callProxyResilient(
       task,
-      prompt + "\n\nIMPORTANT: your previous reply was not valid JSON. Return ONLY the JSON object, nothing else.",
+      {
+        ...prompt,
+        user: prompt.user + "\n\nIMPORTANT: your previous reply was not valid JSON. Return ONLY the JSON object, nothing else."
+      },
       opts
     );
     return extractJson(fixed.text);
   }
 }
 
-export async function callClaudeText(task: ClaudeTask, prompt: string, opts: CallOpts = {}): Promise<string> {
+export async function callClaudeText(task: ClaudeTask, prompt: PromptParts, opts: CallOpts = {}): Promise<string> {
   const { text, stopReason } = await callProxyResilient(task, prompt, opts);
   const trimmed = text.trim();
   if (!trimmed) {

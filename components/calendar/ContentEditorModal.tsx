@@ -6,6 +6,9 @@ import { C, FONT, DISPLAY_FONT, GRAD } from "@/lib/tokens";
 import { STUDIO_FORMATS } from "@/lib/formats";
 import { buildCaptionPrompt } from "@/lib/promptBuilders";
 import { callClaudeText, FAST_MODEL } from "@/lib/claudeClient";
+import { storeGet } from "@/lib/storeClient";
+import { coerceSamples, pickSamples, type VoiceSample } from "@/lib/voiceSamples";
+import { humanizeNote, humanizeText } from "@/lib/humanizePass";
 import {
   PLATFORMS,
   PILLARS_LIST,
@@ -70,6 +73,11 @@ export function ContentEditorModal({
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const overlayArmed = useRef(false);
   const [aiError, setAiError] = useState("");
+  const [passNote, setPassNote] = useState("");
+  // House style and the voice corpus are shared server state, loaded once per
+  // modal open. Both are small blobs and both go straight into the prompt.
+  const [housePrefs, setHousePrefs] = useState("");
+  const [voiceSamples, setVoiceSamples] = useState<VoiceSample[]>([]);
   const [confirmDelete, setConfirmDelete] = useState(false);
 
   useEffect(() => {
@@ -166,6 +174,29 @@ export function ContentEditorModal({
     return () => window.removeEventListener("keydown", onKey);
   }, [isOpen, requestClose]);
 
+  // Load the shared writing context when the modal opens. Failures are silent on
+  // purpose: no house style and no samples means a plainer prompt, not a broken
+  // caption button.
+  useEffect(() => {
+    if (!isOpen) return;
+    // The modal is hidden rather than unmounted, so a note left over from the
+    // last item would otherwise sit above a caption it does not describe.
+    setPassNote("");
+    let live = true;
+    (async () => {
+      const [hp, vs] = await Promise.all([
+        storeGet<string>("kognoz-house-prefs").then((r) => r.value).catch(() => null),
+        storeGet<unknown>("kognoz-voice-samples").then((r) => r.value).catch(() => null)
+      ]);
+      if (!live) return;
+      if (typeof hp === "string") setHousePrefs(hp);
+      setVoiceSamples(coerceSamples(vs));
+    })();
+    return () => {
+      live = false;
+    };
+  }, [isOpen]);
+
   if (!isOpen) return null;
 
   async function handleGenerateAI() {
@@ -180,12 +211,18 @@ export function ContentEditorModal({
     setIsGeneratingAI(true);
     setAiError("");
     try {
+      const samples = pickSamples(voiceSamples, { channel: platform, kind: "post" });
       const prompt = buildCaptionPrompt({
         channel: platform,
         fmt: contentType,
         topic: promptTopic,
         currentCopy: content,
-        instruction: aiInstruction.trim() || undefined
+        instruction: aiInstruction.trim() || undefined,
+        // This argument was simply missing. Every rule the team had added to house
+        // style was invisible to caption generation, while the Studio saw all of
+        // them — so the two surfaces were being written to different rules.
+        housePrefs,
+        voiceSamples: samples
       });
       // Haiku for any REWRITE (half the price of sonnet), sonnet only for a caption
       // written from nothing. This previously keyed off whether an instruction was
@@ -193,7 +230,18 @@ export function ContentEditorModal({
       // sonnet rates to reword copy that already existed.
       const isRewrite = Boolean(content.trim()) || Boolean(aiInstruction.trim());
       const generated = await callClaudeText("caption", prompt, isRewrite ? { model: FAST_MODEL } : undefined);
-      const next = generated.trim();
+
+      // Second pass. Skipped when the team typed an instruction: they asked for a
+      // specific change, and a line edit on top would undo the rest of it.
+      let next = generated.trim();
+      if (aiInstruction.trim()) {
+        setPassNote("");
+      } else {
+        const edited = await humanizeText(next, { voiceSamples: samples, housePrefs, channel: platform });
+        next = edited.value.trim();
+        setPassNote(humanizeNote(edited));
+      }
+
       setUndoStack((s) => [...s, content]);
       setContent(next);
       setAiOutput(next);
@@ -635,6 +683,14 @@ export function ContentEditorModal({
                 </button>
               </div>
               {aiError && <div style={{ fontSize: 11.5, color: "#B4442E" }}>{aiError}</div>}
+              {/* Every caption is written once, then line-edited a second time
+                  against real published posts. This says what that pass did. */}
+              {!aiError && passNote && <div style={{ fontSize: 11.5, color: C.inkMute }}>{passNote}</div>}
+              {!aiError && !passNote && !voiceSamples.length && (
+                <div style={{ fontSize: 11.5, color: C.inkMute }}>
+                  No voice samples saved yet. Paste real published posts in the Studio sidebar and captions stop reading as machine-written.
+                </div>
+              )}
             </div>
           </div>
 

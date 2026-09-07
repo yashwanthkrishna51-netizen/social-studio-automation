@@ -7,6 +7,8 @@ import { callClaudeJSON } from "@/lib/claudeClient";
 import { buildCalendarPlanPrompt } from "@/lib/promptBuilders";
 import { coercePlan, toContentItems, occupiedDates, daysInMonth } from "@/lib/calendarPlan";
 import { CADENCE } from "@/lib/founderProfiles";
+import { coerceSamples, pickSamples } from "@/lib/voiceSamples";
+import { humanizeNote, humanizePlanTopics } from "@/lib/humanizePass";
 import { generateContentId } from "./calendarUtils";
 import { logActivity } from "@/lib/activityClient";
 import { C, FONT } from "@/lib/tokens";
@@ -336,6 +338,10 @@ export function CalendarView() {
     setPlanNote("");
     setError("");
     try {
+      const allSamples = coerceSamples(await storeGet<unknown>("kognoz-voice-samples").then((r) => r.value).catch(() => null));
+      // Six rather than the usual four: a month is planned for three different
+      // voices in one call, so the corpus shown has to cover all three.
+      const planSamples = pickSamples(allSamples, { kind: "post", count: 6 });
       const prompt = buildCalendarPlanPrompt({
         year,
         monthName,
@@ -347,12 +353,21 @@ export function CalendarView() {
           .map((i) => i.topic)
           .filter(Boolean),
         // Never ask for more than there are days to put them on.
-        targetCount: Math.min(CADENCE.postsPerMonth, availableDays.length * 2)
+        targetCount: Math.min(CADENCE.postsPerMonth, availableDays.length * 2),
+        voiceSamples: planSamples
       });
       const reply = await callClaudeJSON("calendarPlan", prompt);
       const plan = coercePlan(reply, { year, month, occupied });
+
+      // Second pass, over the topic lines only. Thirty-six topics written in one
+      // call converge on a single sentence shape, and every post generated from
+      // them inherits it. Only the `topic` string is taken from the reply — days,
+      // channels, formats and pillars are copied across untouched, so this cannot
+      // reschedule anything. A failure returns the plan unchanged.
+      const edited = await humanizePlanTopics(plan.entries, { voiceSamples: planSamples });
+      const plannedNote = humanizeNote(edited);
       const stamp = new Date().toISOString();
-      const fresh = toContentItems(plan, () => generateContentId(), stamp, {
+      const fresh = toContentItems({ ...plan, entries: edited.value }, () => generateContentId(), stamp, {
         name: session?.user?.name,
         email: session?.user?.email
       });
@@ -369,7 +384,8 @@ export function CalendarView() {
         setPlanNote(
           `Added ${fresh.length} posts to ${monthName}.` +
             (skipped ? ` ${skipped} were dropped — they landed on days already taken or could not be read.` : "") +
-            " Nothing already in the calendar was changed."
+            " Nothing already in the calendar was changed. " +
+            plannedNote
         );
       }
     } catch (e) {

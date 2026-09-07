@@ -1,7 +1,15 @@
 import { describe, it, expect } from "vitest";
 import { CHANNEL_IDS, DO_NOT_ASSERT, CADENCE } from "./founderProfiles";
 import { PILLARS_LIST } from "../components/calendar/types";
-import { buildGeneratePrompt, buildCalendarPlanPrompt } from "./promptBuilders";
+import {
+  buildArticlePrompt,
+  buildCalendarPlanPrompt,
+  buildCaptionPrompt,
+  buildGeneratePrompt,
+  buildHumanizePrompt,
+  wholePrompt
+} from "./promptBuilders";
+import { BANNED_PHRASES } from "./slopLint";
 import { DEFAULT_BUDGET } from "./coerce";
 import { STUDIO_FORMATS, FORMATS, FORMAT_BRIEF, SLIDE_SLOTS, bodyBudgetFor } from "./formats";
 import type { FormatId } from "./formats";
@@ -11,7 +19,7 @@ import type { FormatId } from "./formats";
 // contract said to write almost nothing. These lock the contracts in place.
 
 const promptFor = (format: FormatId) =>
-  buildGeneratePrompt({ topic: "Human and AI work transformation", pillar: "Human + AI", format }).prompt;
+  wholePrompt(buildGeneratePrompt({ topic: "Human and AI work transformation", pillar: "Human + AI", format }));
 
 /** Every "max ~N chars" budget the prompt asks Claude for. */
 const askedBudgets = (p: string) =>
@@ -117,13 +125,13 @@ describe("FORMAT_BRIEF — what the user is told before spending credit", () => 
 // about what the prompt is forbidden to let through — the facts research could not
 // confirm. A confident false claim about a real firm is not a style problem.
 describe("buildCalendarPlanPrompt", () => {
-  const prompt = buildCalendarPlanPrompt({
+  const prompt = wholePrompt(buildCalendarPlanPrompt({
     year: 2026,
     monthName: "October",
     availableDays: [1, 2, 5, 6, 7],
     existingTopics: ["A topic already on the calendar"],
     targetCount: 36
-  });
+  }));
 
   it("names all three publishing identities and their real names", () => {
     for (const id of CHANNEL_IDS) expect(prompt).toContain(id);
@@ -182,13 +190,184 @@ describe("buildCalendarPlanPrompt", () => {
   });
 
   it("omits the avoid-list block entirely when nothing is scheduled yet", () => {
-    const fresh = buildCalendarPlanPrompt({
-      year: 2026,
-      monthName: "October",
-      availableDays: [1],
-      existingTopics: [],
-      targetCount: 4
-    });
+    const fresh = wholePrompt(
+      buildCalendarPlanPrompt({
+        year: 2026,
+        monthName: "October",
+        availableDays: [1],
+        existingTopics: [],
+        targetCount: 4
+      })
+    );
     expect(fresh).not.toMatch(/ALREADY SCHEDULED/);
+  });
+});
+
+// The prompt is split so the route can attach cache_control to the system half.
+// That only pays off if the system half really is stable: anything volatile that
+// leaks into it silently puts the input cost back to full price on every call.
+describe("the system / user split", () => {
+  const gen = (topic: string, format: FormatId = "Carousel") =>
+    buildGeneratePrompt({ topic, pillar: "Culture", format });
+
+  it("keeps the system half identical for two topics in the same lane", () => {
+    const a = gen("Culture is what people do under pressure");
+    const b = gen("Culture shows up in what teams do when nobody is watching");
+    expect(a.system).toBe(b.system);
+    expect(a.user).not.toBe(b.user);
+  });
+
+  it("puts the brand canon and the rules in the system half", () => {
+    const { system } = gen("Culture and behaviour");
+    expect(system).toContain("KOGNOZ GROUND TRUTH");
+    expect(system).toContain("BANNED");
+    expect(system).toContain("WRITE UNEVENLY");
+  });
+
+  it("puts the topic and the format contract in the user half", () => {
+    const { system, user } = gen("Culture and behaviour");
+    expect(user).toContain("Culture and behaviour");
+    expect(user).toContain("Return ONLY valid JSON");
+    expect(system).not.toContain("Culture and behaviour");
+  });
+
+  it("keeps the search-grounding instruction out of the cached half", () => {
+    // Grounding flips per call from a UI toggle. In the system half it would
+    // split the cache in two for no reason.
+    const on = buildGeneratePrompt({ topic: "GCC hiring numbers", pillar: "Market Intelligence", format: "Stat Card", grounded: true });
+    const off = buildGeneratePrompt({ topic: "GCC hiring numbers", pillar: "Market Intelligence", format: "Stat Card", grounded: false });
+    expect(on.system).toBe(off.system);
+    expect(on.user).toContain("GROUNDING");
+    expect(off.user).not.toContain("GROUNDING");
+  });
+});
+
+describe("the banned list has exactly one source", () => {
+  it("renders every phrase the linter checks for", () => {
+    const { system } = buildGeneratePrompt({ topic: "Culture", pillar: "Culture", format: "Carousel" });
+    for (const phrase of BANNED_PHRASES) expect(system).toContain(`"${phrase}"`);
+  });
+
+  it("reaches the caption and article prompts too", () => {
+    const caption = buildCaptionPrompt({ channel: "Lokesh", fmt: "Text post", topic: "Culture" }).system;
+    const article = buildArticlePrompt({ topic: "Culture", pillar: "Culture" }).system;
+    // These used to be three hand-maintained copies that had already drifted;
+    // the caption list was missing a third of the phrases the deck list banned.
+    for (const phrase of BANNED_PHRASES) {
+      expect(caption, `caption prompt missing "${phrase}"`).toContain(`"${phrase}"`);
+      expect(article, `article prompt missing "${phrase}"`).toContain(`"${phrase}"`);
+    }
+  });
+});
+
+describe("the prompt no longer hands the model its own clichés", () => {
+  const allFormats = STUDIO_FORMATS.map((f) => promptFor(f)).join("\n");
+
+  it("has dropped the two sentences that were being reused verbatim", () => {
+    expect(allFormats).not.toContain("decisions travel two levels up before anyone commits");
+    expect(allFormats).not.toContain("The survey and the behavior disagree");
+  });
+
+  it("shows at most one lane illustration, and says not to reuse it", () => {
+    const p = wholePrompt(buildGeneratePrompt({ topic: "Culture and engagement", pillar: "Culture", format: "Carousel" }));
+    expect(p).toContain("do not reuse this line");
+    expect((p.match(/How a problem in this lane actually sounds/g) || []).length).toBe(1);
+  });
+
+  it("rotates that illustration with the seed", () => {
+    const a = buildGeneratePrompt({ topic: "Culture and engagement", pillar: "Culture", format: "Carousel", seed: 0 }).system;
+    const b = buildGeneratePrompt({ topic: "Culture and engagement", pillar: "Culture", format: "Carousel", seed: 1 }).system;
+    expect(a).not.toBe(b);
+  });
+});
+
+// BRAND_CORE claimed a Middle East presence and named "the Immersion Index";
+// DO_NOT_ASSERT forbids both. Both blocks went into the calendar-plan prompt, so
+// it instructed and prohibited the same claim in one breath.
+describe("the brand canon no longer contradicts DO_NOT_ASSERT", () => {
+  const everything = [
+    wholePrompt(buildGeneratePrompt({ topic: "Culture", pillar: "Culture", format: "Carousel" })),
+    wholePrompt(buildCaptionPrompt({ channel: "Lokesh", fmt: "Text post", topic: "Culture" })),
+    wholePrompt(buildArticlePrompt({ topic: "Culture", pillar: "Culture" }))
+  ].join("\n");
+
+  it("does not claim a Middle East presence", () => {
+    expect(everything).not.toMatch(/Middle East/);
+  });
+
+  it("does not offer the Immersion Index as approved vocabulary", () => {
+    expect(everything).not.toMatch(/Immersion Index/);
+  });
+
+  it("still carries the prohibition itself in the calendar prompt", () => {
+    // The ban must survive; only the contradicting instruction was removed.
+    const plan = wholePrompt(
+      buildCalendarPlanPrompt({ year: 2026, monthName: "October", availableDays: [1], existingTopics: [], targetCount: 4 })
+    );
+    expect(plan).toContain('Never write "the Immersion Index"');
+    expect(plan).toContain("Never claim a Middle East office");
+  });
+});
+
+describe("voice samples reach the prompt", () => {
+  const samples = [
+    {
+      id: "a",
+      channel: "Lokesh" as const,
+      kind: "post" as const,
+      text: "The engagement survey said ownership. The decision logs said otherwise.",
+      addedAt: "2026-09-04T00:00:00.000Z"
+    }
+  ];
+
+  it("lands in the cacheable half of every writing prompt", () => {
+    for (const p of [
+      buildGeneratePrompt({ topic: "Culture", pillar: "Culture", format: "Carousel", voiceSamples: samples }),
+      buildCaptionPrompt({ channel: "Lokesh", fmt: "Text post", topic: "Culture", voiceSamples: samples }),
+      buildArticlePrompt({ topic: "Culture", pillar: "Culture", voiceSamples: samples }),
+      buildCalendarPlanPrompt({ year: 2026, monthName: "October", availableDays: [1], existingTopics: [], targetCount: 4, voiceSamples: samples })
+    ]) {
+      expect(p.system).toContain("The decision logs said otherwise.");
+      expect(p.system).toContain("written by a human");
+    }
+  });
+
+  it("changes nothing when there are none", () => {
+    const p = buildGeneratePrompt({ topic: "Culture", pillar: "Culture", format: "Carousel", voiceSamples: [] });
+    expect(p.system).not.toContain("SAMPLE 1");
+  });
+});
+
+describe("buildHumanizePrompt", () => {
+  it("holds the shape for a deck and forbids changing the slide count", () => {
+    const p = buildHumanizePrompt({ shape: "deck", draft: '{"cover":"x"}' });
+    expect(p.user).toContain("exactly the same number of slides");
+    expect(p.user).toContain('{"cover":"x"}');
+  });
+
+  it("asks for bare text on a caption", () => {
+    const p = buildHumanizePrompt({ shape: "text", draft: "a post" });
+    expect(p.user).toContain("No JSON");
+  });
+
+  it("forbids rescheduling on a month plan", () => {
+    const p = buildHumanizePrompt({ shape: "topics", draft: '{"items":[]}' });
+    expect(p.user).toContain("Do not change any day, channel, format or pillar");
+  });
+
+  it("tells the editor to leave every fact alone", () => {
+    const p = buildHumanizePrompt({ shape: "text", draft: "d" });
+    expect(p.system).toMatch(/Every fact in the draft must survive unchanged/);
+    expect(p.user).toMatch(/Keep every fact, every number/);
+  });
+
+  it("names sentence-length uniformity as the first thing to fix", () => {
+    const { system } = buildHumanizePrompt({ shape: "text", draft: "d" });
+    expect(system).toMatch(/1\. Every sentence is about the same length/);
+  });
+
+  it("carries the linter findings through when there are any", () => {
+    const p = buildHumanizePrompt({ shape: "text", draft: "d", findings: "\n- [cover] Uses the banned phrase \"unlock\".\n" });
+    expect(p.user).toContain('Uses the banned phrase "unlock"');
   });
 });
